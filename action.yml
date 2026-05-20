@@ -1,0 +1,178 @@
+name: 'Skill Linter'
+description: 'Lint AI agent skill files against the Agent Skills specification using skill-linter'
+author: 'aipcc-cicd'
+
+branding:
+  icon: 'check-circle'
+  color: 'blue'
+
+inputs:
+  path:
+    description: 'Path(s) to lint. Space-separated for multiple paths.'
+    required: false
+    default: '.'
+  format:
+    description: 'Output format: text, json, sarif, or github'
+    required: false
+    default: 'github'
+  fix:
+    description: 'Automatically fix fixable violations'
+    required: false
+    default: 'false'
+  deep:
+    description: 'Enable LLM-powered semantic analysis (requires anthropic-api-key or Vertex AI credentials)'
+    required: false
+    default: 'false'
+  deep-provider:
+    description: 'LLM provider for deep analysis: anthropic or vertex'
+    required: false
+    default: ''
+  deep-model:
+    description: 'Specific LLM model to use for deep analysis'
+    required: false
+    default: ''
+  strict:
+    description: 'Treat warnings as errors (exit code 1 on warnings)'
+    required: false
+    default: 'false'
+  rule:
+    description: 'Comma-separated rule ID(s) to run exclusively'
+    required: false
+    default: ''
+  category:
+    description: 'Comma-separated category name(s) to run exclusively (structural, frontmatter, content, security, best-practices)'
+    required: false
+    default: ''
+  config:
+    description: 'Path to a .skill-linterrc.json configuration file'
+    required: false
+    default: ''
+  no-config:
+    description: 'Bypass config files and use built-in defaults'
+    required: false
+    default: 'false'
+  quiet:
+    description: 'Show only errors; suppress warnings and info messages'
+    required: false
+    default: 'false'
+  verbose:
+    description: 'Show all skills, including those with no issues'
+    required: false
+    default: 'false'
+  version:
+    description: 'skill-linter npm package version to use (e.g. "0.1.4" or "latest")'
+    required: false
+    default: 'latest'
+  anthropic-api-key:
+    description: 'Anthropic API key — required when deep: true with the anthropic provider'
+    required: false
+    default: ''
+  sarif-output:
+    description: 'File path for SARIF output (only applies when format: sarif)'
+    required: false
+    default: 'skill-linter-results.sarif'
+  upload-sarif:
+    description: 'Automatically upload SARIF results to the GitHub Security tab. Requires format: sarif and security-events: write permission on the calling job.'
+    required: false
+    default: 'false'
+
+outputs:
+  sarif-file:
+    description: 'Absolute path to the generated SARIF file (set only when format is sarif)'
+    value: ${{ steps.lint.outputs.sarif-file }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Node.js >=22
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # actions/setup-node@v4
+      with:
+        node-version: '22'
+
+    - name: Run skill-linter
+      id: lint
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        SL_PATH: ${{ inputs.path }}
+        SL_FORMAT: ${{ inputs.format }}
+        SL_FIX: ${{ inputs.fix }}
+        SL_DEEP: ${{ inputs.deep }}
+        SL_DEEP_PROVIDER: ${{ inputs.deep-provider }}
+        SL_DEEP_MODEL: ${{ inputs.deep-model }}
+        SL_STRICT: ${{ inputs.strict }}
+        SL_RULE: ${{ inputs.rule }}
+        SL_CATEGORY: ${{ inputs.category }}
+        SL_CONFIG: ${{ inputs.config }}
+        SL_NO_CONFIG: ${{ inputs.no-config }}
+        SL_QUIET: ${{ inputs.quiet }}
+        SL_VERBOSE: ${{ inputs.verbose }}
+        SL_VERSION: ${{ inputs.version }}
+        SL_SARIF_OUTPUT: ${{ inputs.sarif-output }}
+      run: |
+        set -euo pipefail
+
+        args=()
+
+        # Path(s): space-separated, allow multiple
+        read -ra paths <<< "$SL_PATH"
+        args+=("${paths[@]}")
+
+        # Output format
+        args+=(--format "$SL_FORMAT")
+
+        # Boolean flags
+        [[ "$SL_FIX"       == "true" ]] && args+=(--fix)
+        [[ "$SL_DEEP"      == "true" ]] && args+=(--deep)
+        [[ "$SL_STRICT"    == "true" ]] && args+=(--strict)
+        [[ "$SL_QUIET"     == "true" ]] && args+=(--quiet)
+        [[ "$SL_VERBOSE"   == "true" ]] && args+=(--verbose)
+        [[ "$SL_NO_CONFIG" == "true" ]] && args+=(--no-config)
+
+        # Optional string flags
+        [[ -n "$SL_DEEP_PROVIDER" ]] && args+=(--deep-provider "$SL_DEEP_PROVIDER")
+        [[ -n "$SL_DEEP_MODEL"    ]] && args+=(--deep-model    "$SL_DEEP_MODEL")
+        [[ -n "$SL_CONFIG"        ]] && args+=(--config        "$SL_CONFIG")
+
+        # Comma-separated rules → repeated --rule flags
+        if [[ -n "$SL_RULE" ]]; then
+          IFS=',' read -ra rules <<< "$SL_RULE"
+          for r in "${rules[@]}"; do
+            token="${r// /}"
+            [[ -n "$token" ]] && args+=(--rule "$token")
+          done
+        fi
+
+        # Comma-separated categories → repeated --category flags
+        if [[ -n "$SL_CATEGORY" ]]; then
+          IFS=',' read -ra cats <<< "$SL_CATEGORY"
+          for c in "${cats[@]}"; do
+            token="${c// /}"
+            [[ -n "$token" ]] && args+=(--category "$token")
+          done
+        fi
+
+        if [[ "$SL_FORMAT" == "sarif" ]]; then
+          set +e
+          npx "skill-linter@${SL_VERSION}" check "${args[@]}" > "$SL_SARIF_OUTPUT"
+          exit_code=$?
+          set -e
+          # Exit 0 (clean) and 1 (issues found) both produce valid SARIF — set the output.
+          # Exit 2 (config error) or 3 (CLI error) write non-SARIF text; skip the output.
+          if [[ $exit_code -le 1 ]]; then
+            echo "sarif-file=$(realpath "$SL_SARIF_OUTPUT")" >> "$GITHUB_OUTPUT"
+          fi
+          exit $exit_code
+        else
+          npx "skill-linter@${SL_VERSION}" check "${args[@]}"
+        fi
+
+    - name: Upload SARIF to GitHub Security tab
+      if: >-
+        always() &&
+        inputs.upload-sarif == 'true' &&
+        steps.lint.outputs.sarif-file != '' &&
+        (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      uses: github/codeql-action/upload-sarif@458d36d7d4f47d0dd16ca424c1d3cda0060f1360  # codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ steps.lint.outputs.sarif-file }}
